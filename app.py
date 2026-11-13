@@ -1,15 +1,18 @@
 """Interfaz de Estudio Inteligente con IA."""
 
+import base64
 import calendar as pycalendar
 import colorsys
 import html
 import json
+import os
 import re
-import sqlite3
+import psycopg2
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import requests
 import streamlit as st
 from dotenv import load_dotenv
 
@@ -455,7 +458,7 @@ def _show_session_card(session: dict[str, Any]) -> None:
             try:
                 base_datos.marcar_sesion_realizada(session_id)
                 st.rerun()
-            except (sqlite3.Error, ValueError) as error:
+            except (psycopg2.Error, ValueError) as error:
                 st.error(f"No se pudo marcar la sesión como realizada: {error}")
 
     modal = st.session_state.get("modal_sesion", {})
@@ -638,7 +641,7 @@ def _organization_tab() -> None:
                 session_metrics[1].metric("Próximos", upcoming_sessions)
                 for session in active_sessions:
                     _show_session_card(session)
-        except sqlite3.Error as error:
+        except psycopg2.Error as error:
             st.error(f"No se pudieron cargar las sesiones: {error}")
 
 
@@ -647,7 +650,7 @@ def _exam_tab() -> None:
     try:
         exams = base_datos.obtener_examenes()
         all_sessions = base_datos.obtener_sesiones()
-    except sqlite3.Error as error:
+    except psycopg2.Error as error:
         st.error(f"No se pudieron cargar los exámenes: {error}")
         return
 
@@ -835,7 +838,7 @@ def _calendar_tab() -> None:
     try:
         sessions = base_datos.obtener_sesiones()
         exams = base_datos.obtener_examenes()
-    except sqlite3.Error as error:
+    except psycopg2.Error as error:
         st.error(f"No se pudo cargar el calendario: {error}")
         return
 
@@ -1045,7 +1048,7 @@ def _calendar_tab() -> None:
 
 try:
     base_datos.inicializar_base_datos()
-except (sqlite3.Error, ValueError, json.JSONDecodeError) as error:
+except (psycopg2.Error, ValueError, json.JSONDecodeError) as error:
     st.error(f"No se pudo preparar la base de datos: {error}")
     st.stop()
 
@@ -1104,7 +1107,7 @@ with st.expander("🧪 Modo de prueba (temporal)", expanded=False):
                         f"Se eliminaron {deleted} exámenes de prueba."
                     )
                     st.rerun()
-                except sqlite3.Error as error:
+                except psycopg2.Error as error:
                     st.error(f"No se pudieron eliminar los datos de prueba: {error}")
             if cancel_demo.button("Cancelar", key="cancelar_borrado_demo"):
                 st.session_state.pop("confirmar_eliminar_demo", None)
@@ -1113,8 +1116,103 @@ with st.expander("🧪 Modo de prueba (temporal)", expanded=False):
 if demo_notice := st.session_state.pop("aviso_datos_demo", None):
     st.success(demo_notice)
 
-organization_tab, exams_tab, calendar_tab = st.tabs(
-    ["🏠 Organización", "📚 Mis Exámenes", "📅 Calendario"]
+
+def _image_analysis_tab() -> None:
+    st.markdown("### Analizar una imagen con Gemini")
+    st.caption(
+        "Envía una imagen y una instrucción a la Edge Function de Supabase."
+    )
+    uploaded_image = st.file_uploader(
+        "Selecciona o arrastra una imagen",
+        type=["jpg", "jpeg", "png", "webp"],
+        key="supabase_image_upload",
+    )
+    prompt = st.text_input(
+        "Instrucción para la IA",
+        placeholder="¿Qué quieres que analice de la imagen?",
+        key="supabase_image_prompt",
+    )
+
+    if not st.button("Analizar imagen", type="primary", key="analyze_supabase_image"):
+        return
+    if uploaded_image is None:
+        st.error("Sube una imagen antes de continuar.")
+        return
+    if not prompt.strip():
+        st.error("Escribe una instrucción para la IA.")
+        return
+
+    try:
+        supabase_url = os.getenv("SUPABASE_URL") or st.secrets.get(
+            "SUPABASE_URL", ""
+        )
+        anon_key = os.getenv("SUPABASE_ANON_KEY") or st.secrets.get(
+            "SUPABASE_ANON_KEY", ""
+        )
+    except FileNotFoundError:
+        supabase_url = os.getenv("SUPABASE_URL", "")
+        anon_key = os.getenv("SUPABASE_ANON_KEY", "")
+    if not supabase_url or not anon_key:
+        st.error(
+            "Configura SUPABASE_URL y SUPABASE_ANON_KEY en el entorno "
+            "o en Streamlit Secrets."
+        )
+        return
+
+    mime_types = {
+        "jpg": "image/jpeg",
+        "jpeg": "image/jpeg",
+        "png": "image/png",
+        "webp": "image/webp",
+    }
+    image_format = Path(uploaded_image.name).suffix.lower().lstrip(".")
+    mime_type = mime_types.get(image_format)
+    if mime_type is None:
+        st.error("Formato de imagen no compatible. Usa JPG, PNG o WebP.")
+        return
+
+    image_base64 = (
+        f"data:{mime_type};base64,"
+        f"{base64.b64encode(uploaded_image.getvalue()).decode('ascii')}"
+    )
+    endpoint = f"{supabase_url.rstrip('/')}/functions/v1/analizar-foto"
+    headers = {
+        "Authorization": f"Bearer {anon_key}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        with st.spinner("Analizando la imagen..."):
+            response = requests.post(
+                endpoint,
+                headers=headers,
+                json={"imageBase64": image_base64, "prompt": prompt.strip()},
+                timeout=(10, 180),
+            )
+        response.raise_for_status()
+    except requests.Timeout:
+        st.error(
+            "La Edge Function tardó más de 180 segundos en responder. "
+            "Comprueba su estado y los límites de ejecución de Supabase."
+        )
+        return
+    except requests.HTTPError as error:
+        status_code = error.response.status_code if error.response is not None else "?"
+        st.error(f"Supabase devolvió un error HTTP ({status_code}).")
+        return
+    except requests.RequestException as error:
+        st.error(f"No se pudo conectar con Supabase: {error}")
+        return
+
+    try:
+        result = response.json()
+    except ValueError:
+        result = response.text
+    st.write(result)
+
+
+organization_tab, exams_tab, calendar_tab, image_analysis_tab = st.tabs(
+    ["🏠 Organización", "📚 Mis Exámenes", "📅 Calendario", "🖼️ Analizar imagen"]
 )
 with organization_tab:
     _organization_tab()
@@ -1122,3 +1220,5 @@ with exams_tab:
     _exam_tab()
 with calendar_tab:
     _calendar_tab()
+with image_analysis_tab:
+    _image_analysis_tab()
